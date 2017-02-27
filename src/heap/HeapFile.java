@@ -8,8 +8,6 @@ import global.RID;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Map;
-import java.util.Set;
 
 /**
  * Created by michaelschloss on 2/21/17.
@@ -38,117 +36,159 @@ public class HeapFile
 		}
 		else
 		{
-			System.out.println("First not Null: " + first);
 			heapFileMap = new HeapFileMap(first);
 		}
-
 
 		hashMap = new HashMap<>();
 	}
 
 	public RID insertRecord(byte[] record) throws InvalidUpdateException
 	{
-
 		if (record.length > 1024) throw new InvalidUpdateException();
 
-		//First, do a check to see if any already made HFPages have free space for it
-		if (hashMap.size() != 0)
-		{
-			Set<Map.Entry<RID, HFPage>> entrySet = hashMap.entrySet();
-			for (Map.Entry<RID, HFPage> entry : entrySet)
-			{
-				if (entry.getValue().getFreeSpace() >= record.length)
-				{
-					RID rid = entry.getValue().insertRecord(record);
-					hashMap.put(rid, entry.getValue());
-					return rid;
-				}
-			}
-		}
-
-		HFPage hfPage = new HFPage();
-		RID rid = hfPage.insertRecord(record);
-
-		hashMap.put(rid, hfPage);
-
+		HFPage freePage = heapFileMap.freePageThatFitsSize(record.length);
+		RID rid = freePage.insertRecord(record);
+		heapFileMap.flushPage(rid.pageno);
 		return rid;
 	}
 
-	public Tuple getRecord(RID rid)
+	public Tuple getRecord(RID rid) throws InvalidUpdateException
 	{
-		HFPage page = hashMap.get(rid);
+		HFPage page = heapFileMap.getPage(rid.pageno);
 		byte[] data = page.selectRecord(rid);
 		return new Tuple(data, 0, data.length);
 	}
 
-	public boolean updateRecord(RID rid, Tuple newRecord)
+	public boolean updateRecord(RID rid, Tuple newRecord) throws InvalidUpdateException
 	{
-		if (hashMap.get(rid) == null) return false;
-		HFPage page = hashMap.get(rid);
+		HFPage page = heapFileMap.getPage(rid.pageno);
+		try
+		{
+			page.selectRecord(rid);
+		}
+		catch (Exception ignored)
+		{
+			return false;
+		}
+
 		page.updateRecord(rid, newRecord);
+		heapFileMap.flushPage(rid.pageno);
 		return true;
 	}
 
-	public boolean deleteRecord(RID rid)
+	public boolean deleteRecord(RID rid) throws InvalidUpdateException
 	{
-		if (hashMap.get(rid) == null) return false;
-		HFPage page = hashMap.get(rid);
+		HFPage page = heapFileMap.getPage(rid.pageno);
+		try
+		{
+			page.selectRecord(rid);
+		}
+		catch (Exception ignored)
+		{
+			return false;
+		}
 		page.deleteRecord(rid);
+		heapFileMap.flushPage(rid.pageno);
 		return true;
 	}
 
 	public int getRecCnt() //get number of records in the file public HeapScan openScan()
 	{
-		return 0;
-	}
-
-	public static void main(String argv[])
-	{
-		System.out.println("Creating database...\nReplacer: " + "CLOCK"); //CLOCK replacement policy
-
-		String dbpath = "/tmp/"+"hptest"+System.getProperty("user.name")+".minibase-db"; ;
-
-		/** Default database size (in pages). */
-		int DB_SIZE = 10000;
-
-		/** Default buffer pool size (in pages) */
-		int BUF_SIZE = 100;
-
-		/** Default look ahead size */
-		int LAH_SIZE = 10;
-
-		new Minibase(dbpath, DB_SIZE, BUF_SIZE, LAH_SIZE, "CLOCK", false);
-
-		try
-		{
-			HeapFile heapFile = new HeapFile("Blah");
-		}
-		catch (InvalidUpdateException e)
-		{
-			e.printStackTrace();
-		}
+		return heapFileMap.getNumRecords();
 	}
 }
 
 class HeapFileMap
 {
-	private final PageId header;
-	private ArrayList<HFPage> freePages = new ArrayList<>();
-	private ArrayList<HFPage> allPages = new ArrayList<>();
+	private ArrayList<PageId> freePages = new ArrayList<>();
+	private ArrayList<PageId> allPages = new ArrayList<>();
 
 	HeapFileMap(PageId header)
 	{
-		this.header = header;
 		HFPage first = new HFPage();
 		Minibase.BufferManager.pinPage(header, first, false);
-		System.out.print("first HFPage.  Maybe Something.  " );
-		first.print();
-		allPages.add(first);
+		if (first.firstRecord() == null)
+		{
+			//Hard code these values since everything defaults to 0.
+			first.setPrevPage(new PageId());
+			first.setShortValue((short) 1024, 2);
+			first.setShortValue((short) 1004, 4);
+			first.setCurPage(header);
+			freePages.add(header);
+			Minibase.BufferManager.flushPage(header);
+		}
+		allPages.add(header);
 
+		Minibase.BufferManager.unpinPage(header, true);
 	}
 
-	PageId freePageThatFitsSize(int length)
+	int getNumRecords()
 	{
-		return new PageId();
+		int count = 0;
+		for (PageId pageId : allPages)
+		{
+			HFPage newPage = new HFPage();
+			Minibase.BufferManager.pinPage(pageId, newPage, false);
+			count += newPage.getSlotCount();
+		}
+		return count;
+	}
+
+	HFPage freePageThatFitsSize(int length) throws InvalidUpdateException
+	{
+		for (PageId pageId : freePages)
+		{
+			HFPage page = new HFPage();
+			Minibase.BufferManager.pinPage(pageId, page, false);
+			if (page.getFreeSpace() >= length)
+			{
+				return page;
+			}
+			Minibase.BufferManager.unpinPage(pageId, false);
+		}
+
+		PageId newPageId = Minibase.DiskManager.allocate_page();
+		HFPage newPage = new HFPage();
+		Minibase.BufferManager.pinPage(newPageId, newPage, false);
+		newPage.setPrevPage(allPages.get(allPages.size() - 1));
+		newPage.setCurPage(newPageId);
+		newPage.setShortValue((short) 1024, 2);
+		newPage.setShortValue((short) 1004, 4);
+
+		freePages.add(newPage.getCurPage());
+		allPages.add(newPage.getCurPage());
+
+		return newPage;
+	}
+
+	void flushPage(PageId pageNum) throws InvalidUpdateException
+	{
+		if (!allPages.contains(pageNum))
+		{
+			throw new InvalidUpdateException();
+		}
+		HFPage pageToReturn = new HFPage();
+		Minibase.BufferManager.pinPage(pageNum, pageToReturn, false);
+		if (pageToReturn.getFreeSpace() == 0)
+		{
+			freePages.remove(pageNum);
+		}
+		else if (!freePages.contains(pageNum))
+		{
+			freePages.add(pageNum);
+		}
+		Minibase.BufferManager.flushPage(pageNum);
+	}
+
+	HFPage getPage(PageId pageNum) throws InvalidUpdateException
+	{
+		if (!allPages.contains(pageNum))
+		{
+			throw new InvalidUpdateException();
+		}
+
+		HFPage pageToReturn = new HFPage();
+		Minibase.BufferManager.pinPage(pageNum, pageToReturn, false);
+		return pageToReturn;
 	}
 }
